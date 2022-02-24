@@ -3,6 +3,9 @@ import pandas as pd
 import sys
 from pandas._libs.tslibs.offsets import BDay
 from sklearn.preprocessing import MinMaxScaler
+
+from sklearn.decomposition import PCA
+
 import plotly.graph_objects as go
 from sklearn.preprocessing import StandardScaler
 from sklearn.model_selection import train_test_split
@@ -14,6 +17,12 @@ import torch
 import torch.nn.functional as F
 import torch.nn as nn
 import random
+
+from statsmodels.tsa.stattools import adfuller,kpss
+
+TrainingAccuracy = []
+ValidationAccuracy = []
+ValidationSimulation = []
 
 #def SimulationsTest()
 
@@ -49,6 +58,7 @@ def train(model, device, train_loader, optimizer, epoch, batchSize, test_loader,
         #        epoch, batch_idx * len(data), len(train_loader.dataset),
         #        100. * batch_idx / len(train_loader), loss.item()))
     model_accuracy = total_correct / total_classification * 100
+    TrainingAccuracy.append(model_accuracy)
     ValidationResults = Validation(model, device, test_loader, ValidationPrice)
     print('epoch {0} total_correct: {1} loss: {2:.2f} acc: {3:.2f} '.format(
         epoch, total_correct, total_loss, model_accuracy))
@@ -64,9 +74,7 @@ def Validation(model, device, test_loader, ValidationPrice):
         for data, target in test_loader:
             data, target = data.to(device), target.to(device)
             output = model(data)
-            #print(f"Validation shape = {output.shape}")
             #output = output[:,-1]
-            #print(f"Validation shape = {output.shape}")
             classification = output.detach().numpy()
             realTarget = target.numpy()
             Signals.append(np.argmax(classification[0]))
@@ -77,6 +85,8 @@ def Validation(model, device, test_loader, ValidationPrice):
 
     ValidationReturns = TestSimulation(ValidationPrice, Signals)
     SubOptimalReturns = TestSimulation(ValidationPrice, BestSignals)
+    ValidationAccuracy.append((total_correct/total_classification)*100)
+    ValidationSimulation.append(ValidationReturns)
     return (total_correct / total_classification) * 100, ValidationReturns, SubOptimalReturns
 
 class Network2(torch.nn.Module):
@@ -126,7 +136,7 @@ class ConvNetwork(torch.nn.Module):
         self.HiddenLayer2 = nn.Linear(window, int(window/2))
         self.HiddenLayer3 = nn.Linear(int(window/2), int(window/4))
         self.OutputLayer = nn.Linear(int(window/4), 3)
-        self.out = nn.LogSoftmax()
+        self.out = nn.Softmax()
         self.dropout = nn.Dropout(0.25)
 
     def forward(self, x):
@@ -155,24 +165,27 @@ class PatternNetwork(torch.nn.Module):
         super(PatternNetwork, self).__init__()
         k = window
         #Inputs will be k * 3
-        self.C1 = nn.Conv2d(in_channels=1, out_channels=3, kernel_size=(3,1))
-        # Now we have (k, 1, 3)
-        self.C2 = nn.Conv2d(in_channels=3, out_channels=3, kernel_size=(1,3))
+        self.C1 = nn.Conv2d(in_channels=1, out_channels=6, kernel_size=(3,1))
+        # Now we have (k, 1, 6)
+        #self.C2 = nn.Conv2d(in_channels=3, out_channels=3, kernel_size=(1,3))
         # Now we have (k-2, 1, 3)
         # Now we multiply k-2 * 1 * 3 = 3*k - 6
-        self.LL1 = nn.Linear(3*(k-2), 3*(k-2))
-        self.OutputLayer = nn.Linear(3*(k-2), 3)
+        self.LL1 = nn.Linear(6*k, 3*k)
+        self.LL2 = nn.Linear(3*k, k)
+        self.LL3 = nn.Linear(k, 3)
+        self.OutputLayer = nn.Linear(3, 3)
         self.out = nn.LogSoftmax(dim=1)
 
     def forward(self, x):
         #print(f"shape is : {x.shape}")
         self.L1 = torch.relu(self.C1(x))
-        self.L2 = torch.relu(self.C2(self.L1))
-        self.L2 = self.L2.reshape(self.L2.shape[0], -1)
-        self.L3 = torch.relu(self.LL1(self.L2))
-        self.result = self.OutputLayer(self.L3)
-        self.output = self.out(self.result)
-        return self.output
+        self.L1 = self.L1.reshape(self.L1.shape[0], -1)
+        self.L2 = torch.relu(self.LL1(self.L1))
+        self.L3 = torch.relu(self.LL2(self.L2))
+        self.L4 = torch.relu(self.LL3(self.L3))
+        self.result = self.OutputLayer(self.L4)
+        #self.output = self.out(self.result)
+        return self.result
 
 class WeirdNetwork(torch.nn.Module):
     def __init__(self, window, n):
@@ -294,7 +307,7 @@ def IterativeOptimalSignalling(price, partitioning):
     end = partitioning
     while end <= len(price):
         print(f"i = {i} -- end = {end}")
-        x = OptimisedfindMaxProfitK(price[i:end], 6)
+        x = OptimisedfindMaxProfitK(price[i:end], 12)
         Signals.extend(x[3]) #Lets make a maximum of 3 trades per day
         i += partitioning
         end += partitioning
@@ -362,13 +375,10 @@ def OptimisedfindMaxProfitK(price, k):
 
     indicator = np.ones(len(price))
     indicator *= 0
-    #-1 is hold
-    # 1 is buy
-    # 0 is sell
-
     # 0 us hold
     # 1 is buy
     # 2 is sell
+
     for i,j in zip(BuySignals, SellSignals):
         indicator[i] = 1
         indicator[j] = 2
@@ -430,12 +440,62 @@ def reset_my_index(df):
     res = df[::-1].reset_index(drop=True)
     return (res)
 
+def StationarityTestOfStandardizedData(matrix, name):
+    Mshape = matrix.shape
+    ADFPvalues = []
+    KPSSPvalues = []
+    print("Dickey-Fuller Test for stationarity")
+    for i in range (Mshape[0]): #Test data column wise.
+        dftest = adfuller(matrix[i], autolag='AIC')
+        dfoutput = pd.Series(dftest[0:4],
+                             index=['Test Statistic', 'p-value', '#Lags Used', 'Number of Observations Used'])
+        CriticalVals = []
+        for key, value in dftest[4].items():
+            dfoutput['Critical Value (%s)' % key] = value
+            CriticalVals.append(value)
+
+        print(dfoutput)
+
+        ADFPvalues.append(dftest[1])
+
+        if dftest[1] < 0.05 and dftest[0] < min(CriticalVals):
+            print("p-val < 0.05 and Test statistic < min(Critical values) therefore it is stationary")
+        print("---------------------------")
+
+    print("Kwaitkowsku-Phillips-Schmidt-Shin(KPSS) Test")
+    for i in range(Mshape[0]):
+        kpsstest = kpss(matrix[i], regression='c', nlags="auto")
+        kpss_output = pd.Series(kpsstest[0:3], index=['Test Statistic', 'p-value', '#Lags Used'])
+        CriticalVals = []
+
+        for key, value in kpsstest[3].items():
+            kpss_output['Critical Value (%s)' % key] = value
+            CriticalVals.append(value)
+
+        print(kpss_output)
+
+        KPSSPvalues.append(kpsstest[1])
+
+        if kpsstest[1] - 0.05 > 0:
+            print("p-val > 0.05 therefore it is stationary")
+
+        print("---------------------------")
+
+        print(kpss_output)
+
+    pandasDict = {"ADF p-values" : ADFPvalues, "KPSS p-values" : KPSSPvalues}
+    data = pd.DataFrame.from_dict(pandasDict)
+    data.to_csv(name+"TestValues"+".csv")
+
+
+
+
 if __name__ == "__main__":
     CryptoData, Variables = getData()
     DowData = DowJones()
-    x = reset_my_index(CryptoData[5])
+    x = reset_my_index(CryptoData[0])
     Price = x['close']
-    Volume = x['Volume ' + Variables[5].replace('USDT', '')]
+    Volume = x['Volume ' + Variables[0].replace('USDT', '')]
     TradeCount = x['tradecount']
 
     '''
@@ -475,15 +535,37 @@ if __name__ == "__main__":
     More Data points should generally mean that there are more complexities within the data to capture. 
     '''
     # Over here I am specifying the Range to use to compute the optimal trading actions
-    TempPrice = np.array(Price[2000:])
-    Price = np.array(Price[2000:])
-    Volume = np.array(Volume[2000:])
-    TradeCount = np.array(TradeCount[2000:])
+
+    logR = np.diff(np.log(Price))
+
+    dftest = adfuller(logR, autolag='AIC')
+    dfoutput = pd.Series(dftest[0:4],
+                         index=['Test Statistic', 'p-value', '#Lags Used', 'Number of Observations Used'])
+    CriticalVals = []
+    for key, value in dftest[4].items():
+        dfoutput['Critical Value (%s)' % key] = value
+        CriticalVals.append(value)
+
+    print(dfoutput)
+
+    kpsstest = kpss(logR, regression='c', nlags="auto")
+    kpss_output = pd.Series(kpsstest[0:3], index=['Test Statistic', 'p-value', '#Lags Used'])
+    CriticalVals = []
+
+    for key, value in kpsstest[3].items():
+        kpss_output['Critical Value (%s)' % key] = value
+        CriticalVals.append(value)
+
+    print(kpss_output)
+
+    TempPrice = np.array(Price[3500:])
+    Price = np.array(Price[3500:])
+    Volume = np.array(Volume[3500:])
+    TradeCount = np.array(TradeCount[3500:])
 
     n = len(Price)
-
     #k is the number of inputs or features the network is going to have in the first layer.
-    k = 24
+    k = 6
 
     # Feature Creation
     PriceFeatureMatrix = np.zeros(shape=(n-k, k))
@@ -500,12 +582,13 @@ if __name__ == "__main__":
     '''
     GiganticMatrix = np.zeros(shape=(n-k, 3*k))
     # Extracting the signals which create the max profit with an unrestricted amount of transactions
-    #Signals = findMaxProfit(list(Price))
 
+    #Signals = findMaxProfit(list(Price))
     #Implement Iterative Optimal Signalling
-    #Signals = OptimisedfindMaxProfitK(list(Price), 2000)
+    #Signals = OptimisedfindMaxProfitK(list(TempPrice), 2000)
     #Signals = Signals[3] #Use this line when specifying the number of transactions using OptimalFindMaxProfitK(price, k)
-    Signals = IterativeOptimalSignalling(list(Price), 24)
+    #Signals = IterativeOptimalSignalling(list(Price), 24)
+    Signals = findMaxProfit(list(TempPrice))
 
     '''
     [P_0, P_1, ..., P_23, V_0, V_1, ... , V_23, T_0, T_1, ... , T_23] predict S_23. 
@@ -528,6 +611,7 @@ if __name__ == "__main__":
     k-1 = 23
     Index = [23, 24, ... , 3999]
     '''
+
     print(f"Length of Prices = {len(TempPrice)}")
     print(f"Signals before removing non-assesable signals (all signals < k-1) = {len(Signals)}")
     Signals = np.array(Signals[k-1:-1])
@@ -552,7 +636,6 @@ if __name__ == "__main__":
     print(f"Validation Signals Size = {len(ValidationSignals)}")
     print(f"Length of Validation Prices = {len(ValidationPrice)}")
 
-
     i = 0
     j = 0
     OG = k
@@ -567,11 +650,14 @@ if __name__ == "__main__":
 
     tl = k
     sizes = n-k
+    strDict = {0:"Hold", 1:"Buy", 2:"Sell"}
+
     for i in range(0, sizes):
         temp = np.zeros(shape=(3,tl))
         #PriceFeatureMatrix[i] = (Price[i:k] - min(Price[i:k]))/(max(Price[i:k]) - min(Price[i:k]))
         x = Price[i:k]; x = scaler.fit_transform(x.reshape(-1,1)).ravel(); temp[0] = x
         #print(f"x = {x}")
+
         y = Volume[i:k]; y = scaler.fit_transform(y.reshape(-1,1)).ravel(); temp[1] = y
         #print(f"y = {y}")
         z = TradeCount[i:k]; z = scaler.fit_transform(z.reshape(-1,1)).ravel(); temp[2] = z
@@ -586,17 +672,21 @@ if __name__ == "__main__":
 
 
     print(f"Print Price Feature Matrix = {PriceFeatureMatrix.shape}")
+
     print(f"Print Volume Feature Matrix = {VolumeFeatureMatrix.shape}")
+
     print(f"Print TradeCount Feature Matrix = {TradeCountFeatureMatrix.shape}")
+
     print(f"Print Gigantic Feature Matrix = {GiganticMatrix.shape}")
-    print(f"Print Convolution Feature Matrix = {ConvolutionalMatrix}")
+    print(f"Print Convolutional Feature Matrix = {ConvolutionalMatrix.shape}")
 
-    k = 24
-    #Train, Test= GiganticMatrix[:6000, :], GiganticMatrix[6000:, :]
 
-    #print(ConvolutionalMatrix.shape)
-    #Train, Test = ConvolutionalMatrix[:6000, :, :, :], ConvolutionalMatrix[6000:, :, :, :]
-    Train, Test = GiganticMatrix[:6000, :, :], ConvolutionalMatrix[6000:, :, :]
+    k = 6
+    # Train, Test= GiganticMatrix[:6000, :], GiganticMatrix[6000:, :]
+
+    # print(ConvolutionalMatrix.shape)
+    # Train, Test = ConvolutionalMatrix[:6000, :, :, :], ConvolutionalMatrix[6000:, :, :, :]
+    Train, Test = ConvolutionalMatrix[:6000, :, :], ConvolutionalMatrix[6000:, :, :]
 
     print(f"Print Train Feature Matrix = {Train.shape}")
     print(f"Print Test Feature Matrix = {Test.shape}")
@@ -606,7 +696,7 @@ if __name__ == "__main__":
     I will do this later, I am only focusing on getting the training correct. 
     We must ensure that we remove our non-assessable signals first. 
     Then we split our TrainSignals and TestSignals. 
-    
+
     For our features, we just need to split based on our split for our Signals to produce TrainSignals and TestSignals
     '''
 
@@ -630,33 +720,37 @@ if __name__ == "__main__":
 
     batchSize = 10
     train_dataset = torch.utils.data.TensorDataset(Train, TrainSignals)
-    Train_Loader = torch.utils.data.DataLoader(train_dataset, batch_size = batchSize, shuffle=True)
+    Train_Loader = torch.utils.data.DataLoader(train_dataset, batch_size=batchSize, shuffle=True)
 
     test_dataset = torch.utils.data.TensorDataset(Test, ValidationSignals)
-    Test_Loader = torch.utils.data.DataLoader(test_dataset, batch_size = 1, shuffle=False)
+    Test_Loader = torch.utils.data.DataLoader(test_dataset, batch_size=1, shuffle=False)
 
     totalEpoch = 10000
     if list(net.parameters()):
-        optimizer = torch.optim.SGD(net.parameters(), lr = 0.001, momentum = 0.5)
-        #optimizer = torch.optim.Adam(net.parameters())
-        for epoch in range (1, totalEpoch):
+        optimizer = torch.optim.SGD(net.parameters(), lr=0.001, momentum=0.5)
+        # optimizer = torch.optim.Adam(net.parameters())
+        for epoch in range(1, totalEpoch):
             train(net, device, Train_Loader, optimizer, epoch, batchSize, Test_Loader, ValidationPrice)
 
+    pandadict = {"Validation Accuracy": ValidationAccuracy, "Validation Simulations": ValidationSimulation,
+                 "Training Accuracy": TrainingAccuracy}
+    data = pd.DataFrame.from_dict(pandadict)
+    data.to_csv("PatternNetworkResults.csv")
     '''
     A couple of things:
-    
+
     Instead of Concatenating Matrices we should do something different.
     Recall in Linear/Logistic Regression we have something called the Synergy Effect
-    
+
     So since we have say 3 variables x_1, x_2, x_3
     x_1 is our price
     x_2 is our volume
     x_3 is our trade count
-    
+
     Say this is our regression equation -> relavent for both logistic and linear regression
-    
+
     y = w_0 + w_1*x_1 + w_2*x_2 + w_3*x_3 + w_4*(f(x_1,x_2)) + w_5*(f(x_1,x_3)) + w_6*(f(x_2,x_3)) + w_7*(g(x_1,x_2,x_3))
-    
+
     Now let 
     x_4 = f(x_1,x_2)
     x_5 = f(x_1,x_2)
@@ -665,13 +759,13 @@ if __name__ == "__main__":
 
     Now we have:
     y = w_0 + w_1*x_1 + w_2*x_2 + w_3*x_3 + w_4*x_4 + w_5*x_5  + w_6*x_6  + w_7*x_7 
-    
+
     The above represents synergy amount the variables. We apply the same concept but with neural networks.
-    
+
     Now instead of x_1, x_2, ... , x_7 representing a variable.
     We let our variable instead be a neural network for a specific variable
     So now:
-    
+
     x_1 = NN(X_1)
     x_2 = NN(X_2)
     x_3 = NN(X_3)
@@ -679,17 +773,18 @@ if __name__ == "__main__":
     x_5 = NN(X_5)
     x_6 = NN(X_6)
     x_7 = NN(X_7)
-    
+
     We now have a neural network for each variable. 
     The output of those neural networks, should be a predicted classification, so essentially there will be
     7 nodes. These 7 nodes should be the max value. 
-    
+
     Each of these 7 nodes are then linked to 3 output nodes. There are 21 weights.
-    
+
     Backpropagation will be different. Here in the last later we want to optimise the 21 weights, 
     but we also want to optimise the parameters of the individual and independent neural networks.
-    
+
     So hence the weights connecting 7 nodes to the 3 output nodes are adjusted first. The adjustment of these
     nodes should not impact the way individual neural networks undergo backpropagation. Possibly, there could 
     be more hidden layers in between the 7 classification value nodes and the 3 output nodes too. 
     '''
+
